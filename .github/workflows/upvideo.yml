@@ -1,0 +1,67 @@
+# Tests Bokin Up Video on a fresh Windows and a fresh Linux: the setup script as a person runs it, the self-test, then
+# the end-to-end test against the stand-in Studio (tests/fake_studio.py) with the real Google Chrome, once with the
+# browser window shown and once headless.
+name: Bokin Up Video
+
+on:
+  push:
+    paths:
+      - "upvideo/**"
+      - "tests/**"
+      - "requirements.txt"
+      - "*.bat"
+      - "*.sh"
+      - ".github/workflows/upvideo.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up (cai-dat-windows.bat)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: call cai-dat-windows.bat ci
+
+      - name: Set up (cai-dat-linux.sh)
+        if: runner.os == 'Linux'
+        run: bash cai-dat-linux.sh
+
+      - name: The command wrapper
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: call upvideo.bat channels
+
+      - name: The command wrapper
+        if: runner.os == 'Linux'
+        run: ./upvideo.sh channels
+
+      - name: End-to-end, Chrome window shown
+        if: runner.os == 'Windows'
+        run: .venv\Scripts\python.exe tests\test_upvideo.py
+
+      - name: End-to-end, headless
+        if: runner.os == 'Windows'
+        run: .venv\Scripts\python.exe tests\test_upvideo.py --headless
+
+      - name: End-to-end, Chrome window shown (virtual screen)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a -s "-screen 0 1366x900x24" .venv/bin/python tests/test_upvideo.py
+
+      - name: End-to-end, headless
+        if: runner.os == 'Linux'
+        run: xvfb-run -a .venv/bin/python tests/test_upvideo.py --headless
