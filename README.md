@@ -7,6 +7,8 @@ Tool **không dùng YouTube API**. Nó mở một Chrome thật, đã đăng nh�
 trong YouTube Studio: chọn file, điền tiêu đề và mô tả, chọn **Schedule**, điền ngày giờ, bấm **Schedule**.
 Vì vậy không cần tạo dự án Google hay chờ Google duyệt, và video không bị khoá ở chế độ Riêng tư.
 
+Repo này còn có **Bokin Suno**: tải các bài nhạc đã làm trên Suno (theo workspace) về máy. Xem [SUNO.md](SUNO.md).
+
 ## Cần biết trước
 
 - **Mỗi kênh đăng nhập bằng tay một lần**, ngay trên máy sẽ chạy tool. Tool **không lưu mật khẩu**. Nó giữ phiên

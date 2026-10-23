@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Sets up Bokin Up Video on Linux (Ubuntu/Debian): Python packages in .venv, Google Chrome, a virtual screen (xvfb),
-# a self-test.
+# Sets up Bokin Up Video and Bokin Suno on Linux (Ubuntu/Debian): Python packages in .venv, Google Chrome, a virtual
+# screen (xvfb), the self-tests.
 set -euo pipefail
 cd "$(dirname "$0")"
 SUDO=""
@@ -20,7 +20,9 @@ if ! command -v xvfb-run >/dev/null 2>&1; then
   $SUDO apt-get update
   $SUDO apt-get install -y xvfb
 fi
-chmod +x upvideo.sh
+chmod +x upvideo.sh suno.sh
 .venv/bin/python upvideo/bokin_upvideo.py selftest
+.venv/bin/python suno/bokin_suno.py selftest
 echo
 echo "Xong. Bước tiếp theo: vào VPS bằng Remote Desktop rồi chạy ./upvideo.sh login <tên-kênh> (xem README)"
+echo "hoặc ./suno.sh login <tên-tài-khoản> (xem SUNO.md)"

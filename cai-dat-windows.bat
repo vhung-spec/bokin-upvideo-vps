@@ -1,5 +1,6 @@
 @echo off
-rem Sets up Bokin Up Video on Windows: Python packages in .venv, Google Chrome if missing, a self-test.
+rem Sets up Bokin Up Video and Bokin Suno on Windows: Python packages in .venv, Google Chrome if missing,
+rem the self-tests.
 setlocal
 chcp 65001 >nul
 cd /d "%~dp0"
@@ -22,8 +23,9 @@ if not defined CHROME (
     ".venv\Scripts\python.exe" -m patchright install chrome || goto :fail
 )
 ".venv\Scripts\python.exe" upvideo\bokin_upvideo.py selftest || goto :fail
+".venv\Scripts\python.exe" suno\bokin_suno.py selftest || goto :fail
 echo.
-echo Xong. Buoc tiep theo: upvideo login ten-kenh
+echo Xong. Buoc tiep theo: upvideo login ten-kenh (Up Video) hoac suno login ten-tai-khoan (Suno)
 if "%~1"=="" pause
 exit /b 0
 :fail
