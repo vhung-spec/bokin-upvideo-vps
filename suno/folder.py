@@ -1,9 +1,11 @@
-"""The download folder: the audio files and danh-sach.csv, the list of songs already downloaded into it.
+"""The download folder: the audio files and danh-sach.csv, the list of the songs downloaded into it.
 
-A song (in a format) listed in danh-sach.csv is not downloaded again, even if its file was deleted or renamed; delete
-its line to download it again. Files are named after the song title as Suno shows it; two songs with the same title
-(Suno makes songs in pairs) get "Title (2).wav". Titles come from Suno and are not trusted: anything Windows or Linux
-would read as a path, a device name, a command option or a formula in Excel is taken out.
+A song (in a format) listed in danh-sach.csv as "xong" is not downloaded again, even if its file was deleted or
+renamed; delete its line to download it again. A song listed as "loi" (it failed) is tried again on every run, found
+by its link, even when the workspace's list is no longer read that far. Files are named after the song title as Suno
+shows it; two songs with the same title (Suno makes songs in pairs) get "Title (2).wav". Titles come from Suno and
+are not trusted: anything Windows or Linux would read as a path, a device name, a command option or a formula in
+Excel is taken out.
 """
 import csv
 import io
@@ -13,7 +15,8 @@ from datetime import datetime
 from pathlib import Path
 
 LIST_NAME = "danh-sach.csv"
-COLUMNS = ("ten_bai", "file", "dinh_dang", "link", "luc", "id")
+COLUMNS = ("ten_bai", "file", "trang_thai", "ghi_chu", "dinh_dang", "link", "luc", "id")
+DONE, FAILED = "xong", "loi"
 WINDOWS_RESERVED = {"con", "prn", "aux", "nul"} | {f"{p}{n}" for p in ("com", "lpt") for n in range(1, 10)}
 NAME_MAX = 80
 
@@ -26,6 +29,12 @@ def safe_cell(value):
     """Excel must not run a cell as a formula (song titles are free text)."""
     value = str(value)
     return "'" + value if value[:1] in ("=", "+", "-", "@", "\t", "\r") else value
+
+
+def plain_cell(value):
+    """safe_cell undone, for a cell read back."""
+    value = str(value or "")
+    return value[1:] if value[:1] == "'" and value[1:2] in ("=", "+", "-", "@", "\t", "\r") else value
 
 
 def safe_filename(title, fallback):
@@ -77,17 +86,24 @@ class Folder:
             for rec in csv.DictReader(io.StringIO(text, newline=""), delimiter=delimiter):
                 sid, fmt = (rec.get("id") or "").strip().lower(), (rec.get("dinh_dang") or "").strip().lower()
                 if sid and fmt:
+                    rec = {k: plain_cell(v) for k, v in rec.items() if k}
+                    rec["trang_thai"] = (rec.get("trang_thai") or DONE).strip().lower()  # older lists: all done
                     self.rows[(sid, fmt)] = rec
         self.save()  # fails now, before any download, if Excel holds the file open
 
     def done(self, song_id, fmt):
-        return (song_id, fmt) in self.rows
+        return (self.rows.get((song_id, fmt)) or {}).get("trang_thai") == DONE
+
+    def failed(self, fmt):
+        """(id, title) of the songs that failed before, to try again."""
+        return [(sid, r.get("ten_bai", "")) for (sid, f), r in self.rows.items()
+                if f == fmt and r["trang_thai"] == FAILED]
 
     def target(self, title, song_id, fmt):
         """A new file path for the song: its title, made unique in this folder."""
         stem = safe_filename(title, f"suno-{song_id[:8]}")
         taken = {p.name.lower() for p in self.root.iterdir()}
-        taken |= {(r.get("file") or "").lower() for r in self.rows.values()}
+        taken |= {(r.get("file") or "").lower() for r in self.rows.values() if r.get("file")}
         name, n = f"{stem}.{fmt}", 2
         while name.lower() in taken:
             name, n = f"{stem} ({n}).{fmt}", n + 1
@@ -97,7 +113,14 @@ class Folder:
         return self.root / f".{song_id}.{fmt}.part"
 
     def add(self, song, path, fmt, title):
-        self.rows[(song.id, fmt)] = {"ten_bai": title, "file": Path(path).name, "dinh_dang": fmt, "link": song.link,
+        self._set(song, fmt, title, DONE, file=Path(path).name)
+
+    def add_failure(self, song, fmt, note):
+        self._set(song, fmt, song.title, FAILED, note=note)
+
+    def _set(self, song, fmt, title, status, file="", note=""):
+        self.rows[(song.id, fmt)] = {"ten_bai": title, "file": file, "trang_thai": status, "ghi_chu": note,
+                                     "dinh_dang": fmt, "link": song.link,
                                      "luc": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "id": song.id}
         self.save()
 
@@ -112,3 +135,5 @@ class Folder:
             tmp.replace(self.list_path)
         except PermissionError:
             raise FolderError(f"Không ghi được {self.list_path}: đóng file này trong Excel rồi chạy lại")
+        except OSError as e:
+            raise FolderError(f"Không ghi được {self.list_path}: {e}")

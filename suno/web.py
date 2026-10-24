@@ -162,6 +162,16 @@ def _find_text(page, selector, pattern):
     return None
 
 
+def _poll(page, find, timeout_ms, step_ms=100):
+    """find() again and again until it returns something or the time is up: no fixed waits."""
+    end = time.monotonic() + timeout_ms / 1000
+    while True:
+        found = find()
+        if found or time.monotonic() >= end:
+            return found
+        page.wait_for_timeout(step_ms)
+
+
 def _signed_out_url(url):
     return bool(re.search(r"/(sign-?in|log-?in|sign-?up)\b|accounts\.", url, re.I))
 
@@ -245,8 +255,10 @@ def wait_for_login(context, log, settle_seconds=None, limit_minutes=30):
 
 # ---- the songs of a workspace ----
 
-def list_songs(page, url, log, limit_minutes=20):
-    """The songs shown at `url` (a workspace, playlist or song link), in the order shown."""
+def list_songs(page, url, log, known=None, known_in_a_row=None, limit_minutes=20):
+    """The songs shown at `url` (a workspace, playlist or song link), in the order shown. With known(id) and
+    known_in_a_row, reading stops once that many songs in a row are known: Suno lists the newest songs first, so a
+    second run reads only the top of a large workspace."""
     page.goto(url, wait_until="domcontentloaded", timeout=90_000)
     if page_state(page)[0] != "in":
         raise SunoError("not_signed_in", "Tài khoản Suno chưa đăng nhập hoặc đã bị đăng xuất. Chạy lại: suno login <tên>")
@@ -258,9 +270,9 @@ def list_songs(page, url, log, limit_minutes=20):
     except Exception:
         raise SunoError("no_songs", "Không thấy bài nào ở link này. Kiểm tra link (mở link trong Chrome thường xem có "
                                     "đúng workspace không); workspace trống thì không có gì để tải")
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(1000)
     songs = {}
-    quiet, last_height, last_logged = 0, -1, 0
+    quiet, last_height, last_logged, streak = 0, -1, 0, 0
     deadline = time.monotonic() + limit_minutes * 60
     while time.monotonic() < deadline:
         r = page.evaluate(JS_COLLECT, SEL["song_link"])
@@ -269,8 +281,15 @@ def list_songs(page, url, log, limit_minutes=20):
             if sid not in songs:
                 songs[sid] = text
                 new += 1
+                streak = streak + 1 if known and known(sid) else 0
+                if known_in_a_row and streak >= known_in_a_row:
+                    break
             elif len(text) > len(songs[sid]):
                 songs[sid] = text
+        if known_in_a_row and streak >= known_in_a_row:
+            log.info("Đọc tới bài thứ %d thì gặp %d bài liền đã tải từ trước: dừng đọc danh sách (các bài phía dưới "
+                     "đã tải rồi; muốn đọc hết thì thêm --full)", len(songs), streak)
+            break
         if len(songs) >= last_logged + 50:
             last_logged = len(songs) - len(songs) % 50
             log.info("Đã đọc %d bài...", len(songs))
@@ -286,7 +305,7 @@ def list_songs(page, url, log, limit_minutes=20):
             page.evaluate("() => { const b = document.querySelector('[data-bokin-list]') || document.scrollingElement; "
                           "b.scrollTop = 0; }")
             quiet = 0
-        page.wait_for_timeout(700)
+        page.wait_for_timeout(350 if new and not r["bottom"] else 700)  # quicker while songs keep coming
     else:
         log.warning("Đọc danh sách quá %d phút, dừng ở %d bài", limit_minutes, len(songs))
     if not songs:
@@ -341,27 +360,34 @@ def _open_format_item(page, fmt):
     except Exception:
         raise SunoError("stuck", "Không thấy nút More options (⋯) ở trang bài hát")
     want = SEL["text_format"][fmt]
-    for _ in range(3):
-        more.click()
-        page.wait_for_timeout(600)
-        item = _find_text(page, SEL["menu_item"], want)
+
+    def format_item():
+        return _find_text(page, SEL["menu_item"], want)
+
+    def menu():
+        item = format_item()
         if item:
-            return item
+            return "item", item
         down = _find_text(page, SEL["menu_item"], SEL["text_download"])
-        if down:
-            if not _enabled(down):
+        return ("download", down) if down else None
+
+    for _ in range(3):  # a click before the page is ready does nothing: open the menu again
+        more.click()
+        kind, loc = _poll(page, menu, 3000) or (None, None)
+        if kind == "item":
+            return loc
+        if kind == "download":
+            if not _enabled(loc):
                 raise SunoError("not_ready", "Suno chưa cho tải bài này (bài chưa tạo xong hoặc bị lỗi)")
-            down.hover()
-            page.wait_for_timeout(500)
-            item = _find_text(page, SEL["menu_item"], want)
+            loc.hover()
+            item = _poll(page, format_item, 1500)
             if not item:
-                down.click()
-                page.wait_for_timeout(600)
-                item = _find_text(page, SEL["menu_item"], want)
+                loc.click()
+                item = _poll(page, format_item, 2000)
             if item:
                 return item
         page.keyboard.press("Escape")
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(300)
     raise SunoError("stuck", f"Không thấy mục Download → {fmt.upper()} trong menu của bài hát")
 
 
@@ -389,11 +415,14 @@ def _answer_dialog(page, clicked):
 def download_song(page, catcher, song, fmt, dest, log, timeout_seconds=300):
     """Downloads one song through its page's Download button into `dest`. Returns the title the page shows."""
     page.goto(song.link, wait_until="domcontentloaded", timeout=90_000)
-    if page_state(page)[0] != "in":
-        raise SunoError("not_signed_in", "Tài khoản Suno đã bị đăng xuất. Chạy lại: suno login <tên>")
-    title = _song_title(page)
     catcher.reset()
-    item = _open_format_item(page, fmt)
+    try:
+        item = _open_format_item(page, fmt)
+    except SunoError as e:
+        if e.code == "stuck" and page_state(page, wait_seconds=5)[0] != "in":
+            raise SunoError("not_signed_in", "Tài khoản Suno đã bị đăng xuất. Chạy lại: suno login <tên>")
+        raise
+    title = song.title or _song_title(page)
     if not _enabled(item):
         raise SunoError("not_ready", f"Suno chưa cho tải bài này dạng {fmt.upper()} (bài chưa tạo xong hoặc bị lỗi)")
     item.click()
@@ -419,7 +448,7 @@ def download_song(page, catcher, song, fmt, dest, log, timeout_seconds=300):
                 tab.close()
             break
         _answer_dialog(page, clicked)
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(250)
     else:
         raise SunoError("stuck", f"Đã bấm tải {fmt.upper()} nhưng sau {timeout_seconds} giây vẫn chưa nhận được file")
     page.keyboard.press("Escape")  # close the download box, if it stays open

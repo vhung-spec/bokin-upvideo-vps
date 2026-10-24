@@ -8,9 +8,11 @@ plan's download allowance exactly as by hand; the run stops when Suno says it is
   check [<tai-khoan>]          is each account still signed in
   accounts                     the accounts on this computer
   remove <tai-khoan>           forget an account and its Chrome profile
-  list <tai-khoan> <link>      the songs at a workspace (or playlist) link, without downloading
-  download <tai-khoan> <link> [--out FOLDER] [--format wav|mp3] [--limit N]
-                               every song at the link not yet in FOLDER/danh-sach.csv
+  list <tai-khoan> <link>...   the songs at workspace (or playlist, or song) links, without downloading
+  download <tai-khoan> <link>... [--out FOLDER] [--format wav|mp3] [--limit N] [--full]
+                               every song at the links not yet in FOLDER/danh-sach.csv, and the ones that failed
+                               before; a second run reads a workspace's list only until it meets songs already
+                               downloaded (--full: the whole list)
   selftest                     checks that need no browser
 
 Data (accounts.json, a Chrome profile per account, logs) is in ./data/suno next to the program, or in --data /
@@ -37,6 +39,10 @@ import web  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 ACCOUNT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,39}")
 STUCK_IN_A_ROW = 3  # songs failing one after another like this: Suno's page has most likely changed
+KNOWN_IN_A_ROW = int(os.environ.get("BOKIN_SUNO_KNOWN_STREAK") or 50)  # stop reading a list here (tests: fewer)
+NO_RETRY = ("limit", "not_signed_in", "wrong_account", "not_ready")
+PACE_SECONDS = 1.5  # between songs: a person's pace, not a burst
+SIZE_GUESS = {"wav": 60_000_000, "mp3": 8_000_000}  # bytes per song, for the free-space check
 log = logging.getLogger("suno")
 
 
@@ -244,82 +250,176 @@ def cmd_remove(args, data):
     return 0
 
 
-def read_link(text):
-    try:
-        return web.check_link(text)
-    except ValueError as e:
-        raise UserError(str(e))
+def read_links(texts):
+    links = []
+    for text in texts:
+        try:
+            url = web.check_link(text)
+        except ValueError as e:
+            raise UserError(str(e))
+        if url not in links:
+            links.append(url)
+    return links
 
 
-def songs_at(args, data, context, name, account, url):
-    page = first_page(context)
+def gather_songs(data, page, name, account, links, known=None, known_in_a_row=None):
+    """The songs at every link, each once, in the order shown, and how many links could not be read (a bad link is
+    skipped when there are others)."""
     try:
         web.ensure_account(page, account.get("user_id"))
-        songs = web.list_songs(page, url, log)
     except Exception as e:
-        log.debug("listing failed", exc_info=True)
-        if not isinstance(e, web.SunoError) or e.code == "no_songs":
-            keep_failure(data, page, name)
+        log.debug("sign-in check failed", exc_info=True)
         raise UserError(describe(e))
-    return page, songs
+    songs, bad = {}, 0
+    for url in links:
+        try:
+            found = web.list_songs(page, url, log, known, known_in_a_row)
+        except Exception as e:
+            log.debug("listing failed", exc_info=True)
+            if not isinstance(e, web.SunoError) or e.code == "no_songs":
+                keep_failure(data, page, name)
+            if len(links) == 1 or getattr(e, "code", "") in ("not_signed_in", "wrong_account"):
+                raise UserError(describe(e))
+            log.error("%s: %s", url, describe(e))
+            bad += 1
+            continue
+        if len(links) > 1:
+            log.info("%s: %d bài", url, len(found))
+        for song in found:
+            songs.setdefault(song.id, song)
+    if bad == len(links):
+        raise UserError("Không đọc được link nào")
+    return list(songs.values()), bad
 
 
 def cmd_list(args, data):
     name = args.tai_khoan
     account = known_account(data, name)
-    url = read_link(args.link)
+    links = read_links(args.links)
     with single_run(data), browser(args, data, name, args.headless) as context:
-        _, songs = songs_at(args, data, context, name, account, url)
+        songs, bad = gather_songs(data, first_page(context), name, account, links)
     for n, s in enumerate(songs, 1):
         print(f"{n}\t{s.title or '(không tên)'}\t{s.link}")
-    log.info("Có %d bài ở link này", len(songs))
-    return 0
+    log.info("Có %d bài ở %s", len(songs), "link này" if len(links) == 1 else f"{len(links)} link")
+    return 1 if bad else 0
+
+
+def human_size(n):
+    return f"{n / 1e9:.1f} GB" if n >= 1e9 else f"{n / 1e6:.1f} MB"
+
+
+def human_time(seconds):
+    minutes = round(seconds / 60)
+    if minutes < 1:
+        return "chưa tới 1 phút"
+    if minutes < 60:
+        return f"{minutes} phút"
+    return f"{minutes // 60} giờ {minutes % 60} phút"
+
+
+def disk_full(e):
+    return getattr(e, "errno", None) in (28, 112) or bool(
+        re.search(r"ENOSPC|no space left|not enough space|disk (is )?full", str(e), re.I))
+
+
+def stop_reason(e, page):
+    """Why the run cannot go on after this error, or "" when the next song may still work."""
+    if disk_full(e):
+        return "Ổ đĩa đầy: xoá bớt file hoặc chọn thư mục ở ổ khác (--out), rồi chạy lại"
+    if isinstance(e, folder.FolderError) or getattr(e, "code", "") in ("limit", "not_signed_in", "wrong_account"):
+        return str(e)
+    try:
+        closed = page.is_closed()
+    except Exception:
+        closed = True
+    if closed or "has been closed" in str(e):
+        return "Cửa sổ Chrome của tool đã bị đóng. Chạy lại lệnh để tải tiếp"
+    return ""
+
+
+def check_space(root, count, fmt):
+    if not count:
+        return
+    free = shutil.disk_usage(root).free
+    if free < 2 * SIZE_GUESS[fmt]:
+        raise UserError(f"Ổ đĩa chứa {root} gần đầy (còn {human_size(free)}). Xoá bớt file hoặc chọn thư mục ở ổ "
+                        "khác (--out)")
+    if free < count * SIZE_GUESS[fmt]:
+        log.warning("Ổ đĩa còn %s, có thể không đủ cho %d bài (khoảng %s). Tool tải tới khi đầy thì dừng",
+                    human_size(free), count, human_size(count * SIZE_GUESS[fmt]))
+
+
+def download_one(page, catcher, song, fmt, out, label):
+    """One song into the folder; a second try after a failure Suno's page may not repeat. Returns the file's path."""
+    part = out.part_path(song.id, fmt)
+    try:
+        for attempt in (1, 2):
+            try:
+                title = web.download_song(page, catcher, song, fmt, part, log)
+                if not folder.audio_ok(part, fmt):
+                    raise web.SunoError("stuck", f"File nhận được không phải {fmt.upper()}")
+                break
+            except Exception as e:
+                if attempt == 2 or getattr(e, "code", "") in NO_RETRY or stop_reason(e, page):
+                    raise
+                log.debug("first try failed", exc_info=True)
+                log.warning("%s: %s. Thử lại một lần", label, describe(e))
+                page.wait_for_timeout(3000)
+        path = out.target(title, song.id, fmt)
+        part.replace(path)
+        out.add(song, path, fmt, title)
+        return path
+    finally:
+        with contextlib.suppress(OSError):
+            part.unlink()
 
 
 def cmd_download(args, data):
     name = args.tai_khoan
     account = known_account(data, name)
-    url = read_link(args.link)
+    links = read_links(args.links)
     fmt = args.format
     try:
         out = folder.Folder(args.out or ROOT / "nhac-suno")
     except folder.FolderError as e:
         raise UserError(str(e))
-    done = failed = 0
+    started = time.monotonic()
+    done = failed = size = 0
     stopped = ""
     with single_run(data), browser(args, data, name, args.headless) as context:
-        page, songs = songs_at(args, data, context, name, account, url)
+        page = first_page(context)
+        songs, bad = gather_songs(data, page, name, account, links, lambda sid: out.done(sid, fmt),
+                                  None if args.full else KNOWN_IN_A_ROW)
         todo = [s for s in songs if not out.done(s.id, fmt)]
-        log.info("Có %d bài: %d bài đã tải từ trước, %d bài cần tải %s vào %s", len(songs), len(songs) - len(todo),
-                 len(todo), fmt.upper(), out.root)
+        log.info("Đọc được %d bài: %d bài đã tải từ trước, %d bài cần tải %s vào %s", len(songs),
+                 len(songs) - len(todo), len(todo), fmt.upper(), out.root)
+        listed = {s.id for s in songs}
+        again = [web.Song(sid, title) for sid, title in out.failed(fmt) if sid not in listed]
+        if again:
+            log.info("Thêm %d bài lần trước bị lỗi: thử lại", len(again))
+            todo += again
         if args.limit is not None and len(todo) > args.limit:
             todo = todo[:args.limit]
             log.info("Lần này chỉ tải %d bài (--limit)", len(todo))
+        check_space(out.root, len(todo), fmt)
         catcher = web.Catcher(context)
         stuck = 0
+        loop_started = time.monotonic()
         for n, song in enumerate(todo, 1):
             label = f"[{n}/{len(todo)}] {song.title or song.id}"
-            part = out.part_path(song.id, fmt)
             try:
-                shown = web.download_song(page, catcher, song, fmt, part, log)
-                if not folder.audio_ok(part, fmt):
-                    raise web.SunoError("stuck", f"File nhận được không phải {fmt.upper()}")
-                title = song.title or shown
-                path = out.target(title, song.id, fmt)
-                part.replace(path)
-                out.add(song, path, fmt, title)
+                path = download_one(page, catcher, song, fmt, out, label)
             except Exception as e:
                 log.debug("download failed", exc_info=True)
-                log.error("%s: %s", label, describe(e))
+                note = describe(e)
+                log.error("%s: %s", label, note)
                 failed += 1
-                code = getattr(e, "code", "")
-                if isinstance(e, folder.FolderError):
-                    stopped = str(e)
+                stopped = stop_reason(e, page)
+                if stopped:
                     break
-                if code in ("limit", "not_signed_in", "wrong_account"):
-                    stopped = str(e)
-                    break
-                if code != "not_ready":
+                with contextlib.suppress(folder.FolderError):
+                    out.add_failure(song, fmt, note)  # tried again on the next run
+                if getattr(e, "code", "") != "not_ready":
                     keep_failure(data, page, name)
                     stuck += 1
                     if stuck >= STUCK_IN_A_ROW:
@@ -327,17 +427,20 @@ def cmd_download(args, data):
                                    f"Gửi các file loi-*.png và loi-*.html trong {data.logs} cho người sửa tool")
                         break
                 continue
-            finally:
-                with contextlib.suppress(OSError):
-                    part.unlink()
             stuck = 0
             done += 1
-            log.info("%s: xong → %s", label, path.name)
-            page.wait_for_timeout(1500)  # a person's pace, not a burst
+            size += path.stat().st_size
+            left = len(todo) - n
+            eta = ""
+            if left:
+                eta = f" (còn {left} bài, khoảng {human_time((time.monotonic() - loop_started) / n * left)})"
+            log.info("%s: xong → %s%s", label, path.name, eta)
+            page.wait_for_timeout(PACE_SECONDS * 1000)
     if stopped:
         log.error("Đã dừng: %s", stopped)
-    log.info("Tổng: %d bài tải xong, %d bài lỗi. Danh sách: %s", done, failed, out.list_path)
-    return 1 if failed or stopped else 0
+    log.info("Tổng: %d bài tải xong, %d bài lỗi (%s trong %s). Danh sách: %s", done, failed, human_size(size),
+             human_time(time.monotonic() - started), out.list_path)
+    return 1 if failed or stopped or bad else 0
 
 
 # ---- self-test (no browser) ----
@@ -409,7 +512,21 @@ def cmd_selftest(args, data):
         check("'=Mưa đêm" in raw, "list formula guard")
         (tmp / "nhac" / folder.LIST_NAME).write_bytes(
             f"ten_bai;file;dinh_dang;link;luc;id\r\nA;A.wav;wav;;;{sid}\r\n".encode("utf-8-sig"))
-        check(folder.Folder(tmp / "nhac").done(sid, "wav"), "a list saved by Excel with semicolons")
+        check(folder.Folder(tmp / "nhac").done(sid, "wav"), "a list saved by Excel with semicolons (no status column)")
+        other = web.Song("11111111-2222-3333-4444-555555555555", "=Bài lỗi")
+        out = folder.Folder(tmp / "nhac")
+        out.add_failure(other, "wav", "-Suno chưa cho tải bài này")
+        again = folder.Folder(tmp / "nhac")
+        check(not again.done(other.id, "wav") and again.failed("wav") == [(other.id, "=Bài lỗi")], "a failed song")
+        check("'-Suno" in again.list_path.read_text(encoding="utf-8-sig"), "failure note formula guard")
+        again.add(other, again.target(other.title, other.id, "wav"), "wav", other.title)
+        check(again.done(other.id, "wav") and not again.failed("wav"), "a failed song done at last")
+    check(human_time(20) == "chưa tới 1 phút" and human_time(180) == "3 phút" and human_time(3720) == "1 giờ 2 phút",
+          "times")
+    check(human_size(1_500_000) == "1.5 MB" and human_size(2_300_000_000) == "2.3 GB", "sizes")
+    check(disk_full(OSError(28, "x")) and disk_full(Exception("ENOSPC: no space left on device, write"))
+          and disk_full(OSError("There is not enough space on the disk")) and not disk_full(Exception("timeout")),
+          "disk full")
     import importlib.util
     if importlib.util.find_spec("patchright") is None:
         errors.append("patchright is not installed")
@@ -437,13 +554,15 @@ def main(argv=None):
     s.add_argument("tai_khoan")
     s = sub.add_parser("list", help="xem các bài ở link workspace, không tải")
     s.add_argument("tai_khoan")
-    s.add_argument("link")
+    s.add_argument("links", nargs="+", metavar="link")
     s = sub.add_parser("download", help="tải các bài ở link workspace về thư mục")
     s.add_argument("tai_khoan")
-    s.add_argument("link")
+    s.add_argument("links", nargs="+", metavar="link", help="một hoặc nhiều link workspace / playlist / bài")
     s.add_argument("--out", help="thư mục lưu nhạc (mặc định ./nhac-suno)")
     s.add_argument("--format", choices=("wav", "mp3"), default="wav", help="wav (mặc định) hoặc mp3")
     s.add_argument("--limit", type=int, help="lần này chỉ tải tối đa chừng này bài")
+    s.add_argument("--full", action="store_true", help="đọc hết danh sách workspace (mặc định dừng khi gặp "
+                   f"{KNOWN_IN_A_ROW} bài liền đã tải)")
     sub.add_parser("selftest", help="tự kiểm tra")
     args = p.parse_args(argv)
     if getattr(args, "limit", None) is not None and args.limit < 1:

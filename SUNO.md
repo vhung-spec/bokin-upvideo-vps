@@ -83,19 +83,30 @@ suno download suno1 "https://suno.com/create?wid=..." --out "D:\Nhac\Suno"
 ```
 
 - Link luôn để trong **ngoặc kép**.
+- **Nhiều workspace một lần**: ghi nhiều link liền nhau, cách nhau một dấu cách. Tool chỉ mở Chrome một lần, bài nào có
+  ở hai workspace thì chỉ tải một lần:
+  ```
+  suno download suno1 "LINK-WORKSPACE-1" "LINK-WORKSPACE-2" --out "D:\Nhac\Suno"
+  ```
 - `--out`: thư mục lưu nhạc. Bỏ trống thì lưu vào thư mục `nhac-suno` cạnh tool.
 - Mặc định tải **WAV**. Muốn MP3: thêm `--format mp3`.
 - Tên file là tên bài: `Mưa đêm.wav`. Suno tạo bài theo cặp cùng tên, nên bài thứ hai là `Mưa đêm (2).wav`.
-- Bài đang tạo dở hoặc bị lỗi trên Suno thì được bỏ qua và báo lỗi; lần chạy sau tool thử lại.
+- Mỗi bài xong, tool báo còn bao nhiêu bài và **khoảng bao lâu nữa** thì xong. Cuối cùng nó báo tổng dung lượng đã tải.
+- Bài lỗi được **thử lại ngay một lần**. Vẫn lỗi (ví dụ bài đang tạo dở trên Suno) thì tool bỏ qua, ghi lý do vào
+  `danh-sach.csv`, và **lần chạy sau tự thử lại**.
+- Trước khi tải, tool xem ổ đĩa còn đủ chỗ không (mỗi bài WAV khoảng 60 MB). Ổ đầy giữa chừng thì tool dừng và báo.
 - Nhạc tải về dùng thẳng trong **Bokin Studio Music** (thêm cả thư mục vào danh sách nhạc).
 
 ### File danh-sach.csv
 
-Trong thư mục nhạc có file **`danh-sach.csv`** (mở bằng Excel): mỗi bài đã tải một dòng, gồm tên bài, tên file, link
-bài trên Suno và lúc tải.
+Trong thư mục nhạc có file **`danh-sach.csv`** (mở bằng Excel): mỗi bài một dòng, gồm tên bài, tên file, trạng thái
+(`xong` hoặc `loi`), lý do lỗi, link bài trên Suno và lúc tải.
 
-- **Chạy lại cùng lệnh thì chỉ tải bài mới.** Bài đã có trong `danh-sach.csv` không tải lại, **kể cả khi bạn đã xoá
-  file nhạc**.
+- **Chạy lại cùng lệnh thì chỉ tải bài mới**, và thử lại các bài `loi`. Bài `xong` không tải lại, **kể cả khi bạn đã
+  xoá file nhạc**.
+- **Lần chạy sau nhanh hơn**: Suno xếp bài mới nhất lên đầu, nên tool chỉ đọc phần đầu danh sách của workspace, tới
+  khi gặp 50 bài liền đã tải thì thôi. Nếu bạn chuyển bài **cũ** vào workspace (chúng nằm tít bên dưới), thêm
+  `--full` để tool đọc hết danh sách.
 - Muốn tải lại một bài: xoá dòng của bài đó trong `danh-sach.csv`, lưu lại dạng **CSV UTF-8**, rồi chạy lại.
 - **Đóng `danh-sach.csv` trong Excel** trước khi chạy tool.
 - Mỗi workspace nên tải vào một thư mục riêng cho dễ tìm. Chung một thư mục cũng không sao.
@@ -131,6 +142,8 @@ Trên Linux: thêm lệnh `./suno.sh download ...` vào `crontab -e` (tool tự 
 | Không phải link của Suno | Chép lại link trên thanh địa chỉ, xem *Bước 2* |
 | Không thấy bài nào ở link này | Dán link vào Chrome thường xem có mở đúng workspace không |
 | Suno chưa cho tải bài này | Bài chưa tạo xong hoặc lỗi trên Suno; lần chạy sau tool thử lại |
+| Ổ đĩa đầy / ổ đĩa gần đầy | Xoá bớt file, hoặc chọn thư mục ở ổ khác bằng `--out` |
+| Cửa sổ Chrome của tool đã bị đóng | Chạy lại lệnh: tool tải tiếp từ bài còn thiếu |
 | Suno báo hết lượt tải của gói | Chờ sang tháng mới của gói (hoặc tự mua thêm lượt trên Suno), rồi chạy lại |
 | 3 bài liền nhau không tải được | Có thể Suno đã đổi giao diện: gửi ảnh và file `.html` trong `data/suno/logs` |
 | Không ghi được danh-sach.csv | Đóng file đó trong Excel rồi chạy lại |

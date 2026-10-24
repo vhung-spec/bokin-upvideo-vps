@@ -3,8 +3,9 @@
 It copies only what the program touches (suno/web.py SEL): window.Clerk for the sign-in state, song links in a
 scrolling list that loads more as it scrolls (or by a Load more button) and drops rows scrolled far away, a player
 bar with a link to a song not in the workspace, More Options → Download → MP3 Audio / WAV Audio, the WAV box that
-prepares the file before its Download File button works, an optional "uses 1 download" box for MP3, and the box
-saying the plan's downloads are used up, with a Buy button that must never be pressed. Files arrive as a download
+prepares the file before its Download File button works, an optional "uses 1 download" box for MP3, the box saying
+the plan's downloads are used up, with a Buy button that must never be pressed, and song pages that fail once
+(`fail_once`). Files arrive as a download
 (from a blob or a link) or open in a new tab, as `config["delivery"]` says. Like Suno, a song counts as one download
 whatever the format and however often it is downloaded.
 """
@@ -44,6 +45,8 @@ class FakeSuno:
         self.counted = []  # songs Suno counted as downloads (each song once)
         self.picked = []  # (song id, format) every time a format was chosen in the menu
         self.buy_clicks = 0
+        self.fail_once = set()  # song pages that answer with an error the first time
+        self.list_pages = []  # the pages of the workspace's list that were asked for
         self.lock = threading.Lock()
         self.stray = self.add_song("Bài đang phát", in_workspace=False)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
@@ -125,10 +128,14 @@ class FakeSuno:
                     return self._page(WORKSPACE_BODY, WORKSPACE_SCRIPT.replace("__CFG__", cfg))
                 if len(parts) == 3 and parts[:2] == ["api", "ws"]:
                     page = int(q.get("page", ["0"])[0])
+                    fake.list_pages.append(page)
                     ids = fake.workspace[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
                     out = {"songs": [{"id": s, "title": fake.songs[s]["title"]} for s in ids],
                            "more": (page + 1) * PAGE_SIZE < len(fake.workspace)}
                     return self._send(200, json.dumps(out), "application/json")
+                if len(parts) == 2 and parts[0] == "song" and parts[1] in fake.fail_once:
+                    fake.fail_once.discard(parts[1])
+                    return self._send(503, "<html><body><h1>Something went wrong</h1></body></html>")
                 if len(parts) == 2 and parts[0] == "song" and parts[1] in fake.songs:
                     song = fake.songs[parts[1]]
                     cfg = json.dumps({"id": parts[1], "title": song["title"], "delivery": fake.config["delivery"],

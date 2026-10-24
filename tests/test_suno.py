@@ -1,10 +1,10 @@
 """End-to-end test of Bokin Suno against the stand-in Suno (tests/fake_suno.py), with a real Chrome.
 
 Runs the program as a person would (python suno/bokin_suno.py ...): sign in, check, a workspace whose list loads as
-it scrolls, a few songs first (--limit), then the rest with a song still being made, a second run that downloads
-only new songs, MP3 through a "uses 1 download" box opening in a new tab, one song by its link, a Load more button,
-the plan's downloads used up (nothing bought), a changed Suno page, the wrong account, a sign-out, removing the
-account.
+it scrolls, a few songs first (--limit), then the rest with a song still being made and a song page that fails once,
+a second run that reads only the top of the list yet tries the unfinished song again, MP3 through a "uses 1
+download" box opening in a new tab, several links at once (one of them bad), a Load more button, the plan's
+downloads used up (nothing bought), a changed Suno page, the wrong account, a sign-out, removing the account.
 
   python tests/test_suno.py [--headless] [--chrome PATH] [--keep]
 On Linux without a screen: xvfb-run -a python tests/test_suno.py
@@ -58,7 +58,7 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="sn-", dir=None if sys.platform == "win32" else "/tmp"))
     data = tmp / "data"
     env = dict(os.environ, BOKIN_SUNO_URL=fake.url, BOKIN_SUNO_DATA=str(data), BOKIN_SUNO_LOGIN_SETTLE="2",
-               PYTHONIOENCODING="utf-8")
+               BOKIN_SUNO_KNOWN_STREAK="5", PYTHONIOENCODING="utf-8")
     base = [sys.executable, str(PROG)]
     if opts.headless:
         base.append("--headless")
@@ -108,13 +108,19 @@ def main():
         cli("download", "suno1", link, "--out", str(nhac), "--limit", "2", contains="2 bài tải xong")
         check(len(files(nhac, "wav")) == 2, "two WAV files")
 
-        print("== the rest of the workspace; one song is still being made")
-        cli("download", "suno1", link, "--out", str(nhac), expect=1, contains="19 bài tải xong, 1 bài lỗi")
+        print("== the rest of the workspace; one song is still being made, one song page fails once")
+        fake.fail_once = {ids[15]}
+        out = cli("download", "suno1", link, "--out", str(nhac), expect=1, contains="19 bài tải xong, 1 bài lỗi")
+        check("thử lại một lần" in out.lower() and not fake.fail_once, "the failing page was tried again")
+        check("còn 1 bài, khoảng" in out, "time left shown")
         got = {p.name: p.read_bytes() for p in files(nhac, "wav")}
         check(len(got) == len(titles), f"{len(titles)} WAV files ({len(got)})")
         rows = read_list(nhac)
-        by_id = {r["id"]: r for r in rows}
+        by_id = {r["id"]: r for r in rows if r["trang_thai"] == "xong"}
         check(set(by_id) == set(ids), "danh-sach.csv lists every downloaded song once")
+        failed_rows = [r for r in rows if r["trang_thai"] == "loi"]
+        check([r["id"] for r in failed_rows] == [making] and "chưa cho tải" in failed_rows[0]["ghi_chu"],
+              "the unfinished song listed as failed, with the reason")
         for sid in ids:
             rec = by_id.get(sid, {})
             check(got.get(rec.get("file")) == audio_bytes(sid, "wav"), f"{rec.get('file')} is that song's WAV")
@@ -122,20 +128,24 @@ def main():
         for name in ("Mưa đêm.wav", "Mưa đêm (2).wav", "thoát ra.wav", "_CON.wav", "Phố cũ.wav", "cmd C calc !A0.wav"):
             check(name in names, f"file name {name}")
         check(all(p.parent == nhac for p in nhac.rglob("*.wav")), "no file outside the folder")
-        check(fake.stray not in by_id and making not in by_id, "the player's song and the unfinished song skipped")
+        check(fake.stray not in {r["id"] for r in rows}, "the player's song skipped")
         raw = (nhac / "danh-sach.csv").read_text(encoding="utf-8-sig")
         check("'=cmd" in raw, "a title starting with = is not a formula in Excel")
         check(sorted(fake.counted) == sorted(ids), "Suno counted each downloaded song once")
         check(not list(nhac.glob("*.part")) and not list(nhac.glob(".*.part")), "no half-downloaded files left")
 
-        print("== again, with the song finished and two new songs: only those three")
+        print("== again, with the song finished and two new songs: only those three, reading only the top of the list")
         fake.songs[making]["status"] = "complete"
         new = [fake.add_song("Bài mới 1"), fake.add_song("Bài mới 2")]
         picked = len(fake.picked)
-        cli("download", "suno1", link, "--out", str(nhac), contains="3 bài tải xong, 0 bài lỗi")
+        out = cli("download", "suno1", link, "--out", str(nhac), contains="3 bài tải xong, 0 bài lỗi")
+        check("dừng đọc danh sách" in out and "1 bài lần trước bị lỗi" in out, "top of the list, then the failed song")
         check(sorted(s for s, _ in fake.picked[picked:]) == sorted(new + [making]), "only the three were downloaded")
+        check(all(r["trang_thai"] == "xong" for r in read_list(nhac)), "no failed song left in the list")
         picked = len(fake.picked)
         cli("download", "suno1", link, "--out", str(nhac), contains="0 bài cần tải")
+        out = cli("download", "suno1", link, "--out", str(nhac), "--full", contains="0 bài cần tải")
+        check("dừng đọc danh sách" not in out and f"Đọc được {len(fake.workspace)} bài" in out, "--full reads it all")
         check(len(fake.picked) == picked, "nothing downloaded twice")
 
         print("== MP3, a 'uses 1 download' box, the file opening in a new tab")
@@ -149,10 +159,13 @@ def main():
         check(len(fake.counted) == counted, "songs already downloaded as WAV count no more")
         fake.config.update(confirm=False, delivery="attach")
 
-        print("== one song by its link")
-        one = tmp / "mot-bai"
-        cli("download", "suno1", f"{fake.url}/song/{ids[6]}?sh=abc", "--out", str(one), contains="1 bài tải xong")
-        check([p.name for p in files(one, "wav")] == ["Phố cũ.wav"], "named after the song page's title")
+        print("== several links at once, one of them bad")
+        one = tmp / "vai-bai"
+        cli("download", "suno1", f"{fake.url}/create?wid=nothing", f"{fake.url}/song/{ids[6]}?sh=abc",
+            f"{fake.url}/song/{ids[5]}", f"{fake.url}/song/{ids[6]}", "--out", str(one), expect=1,
+            contains="2 bài tải xong, 0 bài lỗi")
+        check(sorted(p.name for p in files(one, "wav")) == ["Phố cũ.wav", "b Đậm b & nháy.wav"],
+              "named after the song pages' titles, each song once")
         fake.config["delivery"] = "blob"
 
         print("== a Load more button instead of scrolling")
